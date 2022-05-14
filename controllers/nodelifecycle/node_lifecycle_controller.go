@@ -19,9 +19,10 @@ package cloud
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
@@ -127,6 +128,11 @@ func (c *CloudNodeLifecycleController) MonitorNodes(ctx context.Context) {
 	}
 
 	for _, node := range nodes {
+		// Skip foreign node
+		if node.Spec.ProviderID != "" && !strings.HasPrefix(node.Spec.ProviderID, c.cloud.ProviderName()) {
+			continue
+		}
+
 		// Default NodeReady status to v1.ConditionUnknown
 		status := v1.ConditionUnknown
 		if _, c := nodeutil.GetNodeCondition(&node.Status, v1.NodeReady); c != nil {
@@ -140,6 +146,27 @@ func (c *CloudNodeLifecycleController) MonitorNodes(ctx context.Context) {
 				klog.Errorf("error patching node taints: %v", err)
 			}
 			continue
+		}
+
+		// Wait uninitialized unknown node
+		if node.Spec.ProviderID == "" {
+			uninitialized := false
+
+			for _, taint := range node.Spec.Taints {
+				if taint.Key == cloudproviderapi.TaintExternalCloudProvider {
+					uninitialized = true
+				}
+			}
+
+			// Do not delete node for 5 minutes after creation
+			if uninitialized {
+				delay := time.Since(node.ObjectMeta.CreationTimestamp.Time)
+				if delay < time.Duration(5*time.Minute) {
+					klog.V(2).Infof("Wait uninitialized node %s for %s", node.Name, delay.String())
+
+					continue
+				}
+			}
 		}
 
 		// At this point the node has NotReady status, we need to check if the node has been removed

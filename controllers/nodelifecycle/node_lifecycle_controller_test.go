@@ -32,6 +32,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
+	cloudproviderapi "k8s.io/cloud-provider/api"
 	fakecloud "k8s.io/cloud-provider/fake"
 	"k8s.io/klog/v2"
 )
@@ -62,6 +63,63 @@ func Test_NodesDeleted(t *testing.T) {
 					},
 				},
 			},
+			expectedDeleted: true,
+			fakeCloud: &fakecloud.Cloud{
+				ExistsByProviderID: false,
+			},
+		},
+		{
+			name: "node is not ready and uninitialized",
+			existingNode: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "node-uninitialized",
+					CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
+				},
+				Spec: v1.NodeSpec{
+					Taints: []v1.Taint{
+						{
+							Key:    cloudproviderapi.TaintExternalCloudProvider,
+							Value:  "true",
+							Effect: v1.TaintEffectNoSchedule,
+						},
+					},
+				},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:               v1.NodeReady,
+							Status:             v1.ConditionFalse,
+							LastHeartbeatTime:  metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+							LastTransitionTime: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+						},
+					},
+				},
+			},
+			// expectedNode: &v1.Node{
+			// 	ObjectMeta: metav1.ObjectMeta{
+			// 		Name:              "node-uninitialized",
+			// 		CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
+			// 	},
+			// 	Spec: v1.NodeSpec{
+			// 		Taints: []v1.Taint{
+			// 			{
+			// 				Key:    cloudproviderapi.TaintExternalCloudProvider,
+			// 				Value:  "true",
+			// 				Effect: v1.TaintEffectNoSchedule,
+			// 			},
+			// 		},
+			// 	},
+			// 	Status: v1.NodeStatus{
+			// 		Conditions: []v1.NodeCondition{
+			// 			{
+			// 				Type:               v1.NodeReady,
+			// 				Status:             v1.ConditionFalse,
+			// 				LastHeartbeatTime:  metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+			// 				LastTransitionTime: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+			// 			},
+			// 		},
+			// 	},
+			// },
 			expectedDeleted: true,
 			fakeCloud: &fakecloud.Cloud{
 				ExistsByProviderID: false,
@@ -155,6 +213,7 @@ func Test_NodesDeleted(t *testing.T) {
 			},
 			expectedDeleted: false,
 			fakeCloud: &fakecloud.Cloud{
+				Provider:           "node0",
 				ExistsByProviderID: true,
 			},
 		},
@@ -595,6 +654,7 @@ func Test_NodesShutdown(t *testing.T) {
 			fakeCloud: &fakecloud.Cloud{
 				NodeShutdown:            true,
 				ExistsByProviderID:      true,
+				Provider:                "node0",
 				ErrShutdownByProviderID: nil,
 			},
 		},
