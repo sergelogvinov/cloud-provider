@@ -21,7 +21,7 @@ import (
 	"errors"
 	"time"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
@@ -151,6 +151,33 @@ func (c *CloudNodeLifecycleController) MonitorNodes(ctx context.Context) {
 		}
 
 		if !exists {
+			skip := false
+
+			// Do not touch unknown uninitialized nodes
+			if node.Spec.ProviderID == "" {
+				for _, taint := range node.Spec.Taints {
+					if taint.Key == cloudproviderapi.TaintExternalCloudProvider {
+						klog.V(2).Infof("This unknown node %s is still tainted. Will not process.", node.Name)
+
+						skip = true
+					}
+				}
+			}
+
+			// Do not delete node for 5 minutes after creation
+			if status == v1.ConditionFalse {
+				delay := time.Since(node.ObjectMeta.CreationTimestamp.Time)
+				if delay < time.Duration(5*time.Minute) {
+					klog.V(2).Infof("Wait %s node %s", delay.String(), node.Name)
+
+					skip = skip || true
+				}
+			}
+
+			if skip {
+				continue
+			}
+
 			// Current node does not exist, we should delete it, its taints do not matter anymore
 
 			klog.V(2).Infof("deleting node since it is no longer present in cloud provider: %s", node.Name)
