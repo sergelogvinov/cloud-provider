@@ -19,10 +19,11 @@ package cloud
 import (
 	"context"
 	"errors"
-	"github.com/google/go-cmp/cmp"
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/google/go-cmp/cmp"
 
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -34,11 +35,15 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
 	cloudprovider "k8s.io/cloud-provider"
+	cloudproviderapi "k8s.io/cloud-provider/api"
 	fakecloud "k8s.io/cloud-provider/fake"
 	"k8s.io/klog/v2"
 )
 
 func Test_NodesDeleted(t *testing.T) {
+	createNodeTime := metav1.Now()
+	createNodeTimeOut := metav1.NewTime(createNodeTime.Add(-2 * uninitializedNodeDelay))
+
 	testcases := []struct {
 		name            string
 		fakeCloud       *fakecloud.Cloud
@@ -157,6 +162,7 @@ func Test_NodesDeleted(t *testing.T) {
 			},
 			expectedDeleted: false,
 			fakeCloud: &fakecloud.Cloud{
+				Provider:           "node0",
 				ExistsByProviderID: true,
 			},
 		},
@@ -386,6 +392,95 @@ func Test_NodesDeleted(t *testing.T) {
 			fakeCloud: &fakecloud.Cloud{
 				EnableInstancesV2:  true,
 				ExistsByProviderID: true,
+			},
+		},
+		{
+			name: "[instancev2] node is not ready and uninitialized",
+			existingNode: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "node-uninitialized",
+					CreationTimestamp: createNodeTime,
+				},
+				Spec: v1.NodeSpec{
+					Taints: []v1.Taint{
+						{
+							Key:    cloudproviderapi.TaintExternalCloudProvider,
+							Value:  "true",
+							Effect: v1.TaintEffectNoSchedule,
+						},
+					},
+				},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:               v1.NodeReady,
+							Status:             v1.ConditionFalse,
+							LastHeartbeatTime:  metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+							LastTransitionTime: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+						},
+					},
+				},
+			},
+			expectedNode: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "node-uninitialized",
+					CreationTimestamp: createNodeTime,
+				},
+				Spec: v1.NodeSpec{
+					Taints: []v1.Taint{
+						{
+							Key:    cloudproviderapi.TaintExternalCloudProvider,
+							Value:  "true",
+							Effect: v1.TaintEffectNoSchedule,
+						},
+					},
+				},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:               v1.NodeReady,
+							Status:             v1.ConditionFalse,
+							LastHeartbeatTime:  metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+							LastTransitionTime: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+						},
+					},
+				},
+			},
+			expectedDeleted: false,
+			fakeCloud: &fakecloud.Cloud{
+				EnableInstancesV2: true,
+			},
+		},
+		{
+			name: "[instancev2] node is not ready and uninitialized timeout passed",
+			existingNode: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "node-uninitialized",
+					CreationTimestamp: createNodeTimeOut,
+				},
+				Spec: v1.NodeSpec{
+					Taints: []v1.Taint{
+						{
+							Key:    cloudproviderapi.TaintExternalCloudProvider,
+							Value:  "true",
+							Effect: v1.TaintEffectNoSchedule,
+						},
+					},
+				},
+				Status: v1.NodeStatus{
+					Conditions: []v1.NodeCondition{
+						{
+							Type:               v1.NodeReady,
+							Status:             v1.ConditionFalse,
+							LastHeartbeatTime:  metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+							LastTransitionTime: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+						},
+					},
+				},
+			},
+			expectedDeleted: true,
+			fakeCloud: &fakecloud.Cloud{
+				EnableInstancesV2: true,
 			},
 		},
 		{
