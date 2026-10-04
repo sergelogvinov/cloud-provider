@@ -95,6 +95,7 @@ type Cloud struct {
 	RouteMap       map[string]*Route
 	Lock           sync.Mutex
 	Provider       string
+	Platforms      []string
 	ProviderID     map[types.NodeName]string
 	addCallLock    sync.Mutex
 	cloudprovider.Zone
@@ -155,6 +156,11 @@ func (f *Cloud) ProviderName() string {
 // HasClusterID returns true if the cluster has a clusterID
 func (f *Cloud) HasClusterID() bool {
 	return true
+}
+
+// ProviderPlatforms returns the list of supported platform identifiers.
+func (f *Cloud) ProviderPlatforms() []string {
+	return f.Platforms
 }
 
 // LoadBalancer returns a fake implementation of LoadBalancer.

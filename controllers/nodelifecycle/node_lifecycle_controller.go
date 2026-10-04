@@ -38,6 +38,7 @@ import (
 	cloudprovider "k8s.io/cloud-provider"
 	cloudproviderapi "k8s.io/cloud-provider/api"
 	cloudnodeutil "k8s.io/cloud-provider/node/helpers"
+	"k8s.io/cloud-provider/node/ownership"
 	controllersmetrics "k8s.io/component-base/metrics/prometheus/controllers"
 	nodeutil "k8s.io/component-helpers/node/util"
 	"k8s.io/klog/v2"
@@ -67,6 +68,11 @@ type CloudNodeLifecycleController struct {
 	recorder    record.EventRecorder
 
 	cloud cloudprovider.Interface
+	// ownership determines which nodes are managed by this cloud provider.
+	ownership *ownership.Checker
+	// nodeLifecycleWaitTimeout is the time to wait for a node without ProviderID
+	// to be initialized by its own cloud controller manager. Nil means the default.
+	nodeLifecycleWaitTimeout *time.Duration
 
 	// Value controlling NodeController monitoring period, i.e. how often does NodeController
 	// check node status posted from kubelet. This value should be lower than nodeMonitorGracePeriod
@@ -77,12 +83,26 @@ type CloudNodeLifecycleController struct {
 	concurrentNodeLifecycleSyncs int
 }
 
+// Option configures the CloudNodeLifecycleController.
+type Option func(*CloudNodeLifecycleController)
+
+// WithNodeLifecycleWaitTimeout sets the time the controller waits for a node without
+// ProviderID to be initialized by its own cloud controller manager, counted from the
+// node creation. It is used in both single-cloud and hybrid mode.
+// If not set, it defaults to ownership.DefaultNodeLifecycleWaitTimeout in hybrid mode and 0 otherwise.
+func WithNodeLifecycleWaitTimeout(timeout time.Duration) Option {
+	return func(c *CloudNodeLifecycleController) {
+		c.nodeLifecycleWaitTimeout = &timeout
+	}
+}
+
 func NewCloudNodeLifecycleController(
 	nodeInformer coreinformers.NodeInformer,
 	kubeClient clientset.Interface,
 	cloud cloudprovider.Interface,
 	nodeMonitorPeriod time.Duration,
-	concurrentNodeLifecycleSyncs int) (*CloudNodeLifecycleController, error) {
+	concurrentNodeLifecycleSyncs int,
+	opts ...Option) (*CloudNodeLifecycleController, error) {
 
 	registerMetrics()
 
@@ -108,8 +128,20 @@ func NewCloudNodeLifecycleController(
 		kubeClient:                   kubeClient,
 		nodeLister:                   nodeInformer.Lister(),
 		cloud:                        cloud,
+		ownership:                    ownership.NewChecker(ownership.Platforms(cloud)),
 		nodeMonitorPeriod:            nodeMonitorPeriod,
 		concurrentNodeLifecycleSyncs: concurrentNodeLifecycleSyncs,
+	}
+
+	for _, opt := range opts {
+		opt(c)
+	}
+
+	if c.ownership.HybridMode() {
+		klog.Infof("Node ownership is enabled, managing nodes with platforms: %v", c.ownership.Platforms())
+	}
+	if timeout := c.waitTimeout(); timeout > 0 {
+		klog.Infof("Node lifecycle wait timeout for nodes without ProviderID: %v", timeout)
 	}
 
 	return c, nil
@@ -154,6 +186,10 @@ func (c *CloudNodeLifecycleController) MonitorNodes(ctx context.Context) {
 
 	processNode := func(piece int) {
 		node := nodes[piece].DeepCopy()
+		if c.skipNode(node) {
+			return
+		}
+
 		// Default NodeReady status to v1.ConditionUnknown
 		status := v1.ConditionUnknown
 		if _, c := nodeutil.GetNodeCondition(&node.Status, v1.NodeReady); c != nil {
@@ -172,6 +208,10 @@ func (c *CloudNodeLifecycleController) MonitorNodes(ctx context.Context) {
 		// from the cloud provider. If node cannot be found in cloudprovider, then delete the node
 		exists, err := c.ensureNodeExistsByProviderID(ctx, node)
 		if err != nil {
+			if ownership.IsNotOwned(err) {
+				ownership.RecordNotOwned(ownership.ControllerNodeLifecycle, node)
+				return
+			}
 			klog.Errorf("error checking if node %s exists: %v", node.Name, err)
 			return
 		}
@@ -203,6 +243,10 @@ func (c *CloudNodeLifecycleController) MonitorNodes(ctx context.Context) {
 			// does not delete node from kubernetes cluster when instance it is shutdown see issue #46442
 			shutdown, err := c.shutdownInCloudProvider(ctx, node)
 			if err != nil {
+				if ownership.IsNotOwned(err) {
+					ownership.RecordNotOwned(ownership.ControllerNodeLifecycle, node)
+					return
+				}
 				klog.Errorf("error checking if node %s is shutdown: %v", node.Name, err)
 				return
 			}
@@ -220,6 +264,37 @@ func (c *CloudNodeLifecycleController) MonitorNodes(ctx context.Context) {
 
 	duration := time.Since(startTime).Seconds()
 	monitorNodesDuration.Observe(duration)
+}
+
+// waitTimeout returns the time to wait for a node without ProviderID to be initialized.
+// An explicitly set timeout is used in any mode, otherwise it defaults to
+// ownership.DefaultNodeLifecycleWaitTimeout in hybrid mode and 0 (no wait) otherwise.
+func (c *CloudNodeLifecycleController) waitTimeout() time.Duration {
+	if c.nodeLifecycleWaitTimeout != nil {
+		return *c.nodeLifecycleWaitTimeout
+	}
+	if c.ownership.HybridMode() {
+		return ownership.DefaultNodeLifecycleWaitTimeout
+	}
+	return 0
+}
+
+// skipNode returns true if the node must not be processed by this cloud provider:
+// the node belongs to another platform, or it has no ProviderID yet and
+// its own cloud controller manager may still initialize it.
+func (c *CloudNodeLifecycleController) skipNode(node *v1.Node) bool {
+	if node.Spec.ProviderID == "" {
+		timeout := c.waitTimeout()
+		if age := time.Since(node.CreationTimestamp.Time); age < timeout {
+			klog.V(4).Infof("Skipping node %s without ProviderID, waiting %v for node initialization", node.Name, timeout-age)
+			ownership.RecordSkipped(ownership.ControllerNodeLifecycle, ownership.ReasonTimeoutWait)
+			return true
+		}
+		// The node was not initialized in time, use the default behavior.
+		return false
+	}
+
+	return c.ownership.SkipNode(ownership.ControllerNodeLifecycle, node)
 }
 
 // getProviderID returns the provider ID for the node. If Node CR has no provider ID,
@@ -317,6 +392,8 @@ func observeInstanceOp(operation string, err error) {
 		result = "not_implemented"
 	case errors.Is(err, cloudprovider.InstanceNotFound):
 		result = "instance_not_found"
+	case errors.Is(err, cloudprovider.NotOwned):
+		result = "not_owned"
 	case errors.Is(err, context.Canceled):
 		result = "canceled"
 	case err != nil:

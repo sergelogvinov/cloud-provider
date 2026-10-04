@@ -31,6 +31,7 @@ import (
 	cloudnodelifecyclecontroller "k8s.io/cloud-provider/controllers/nodelifecycle"
 	routecontroller "k8s.io/cloud-provider/controllers/route"
 	servicecontroller "k8s.io/cloud-provider/controllers/service"
+	"k8s.io/cloud-provider/node/ownership"
 	controllermanagerapp "k8s.io/controller-manager/app"
 	"k8s.io/controller-manager/controller"
 	"k8s.io/klog/v2"
@@ -45,7 +46,7 @@ func startCloudNodeController(ctx context.Context, initContext ControllerInitCon
 		completedConfig.SharedInformers.Core().V1().Nodes(),
 		// cloud node controller uses existing cluster role from node-controller
 		completedConfig.ClientBuilder.ClientOrDie(initContext.ClientName),
-		cloud,
+		ownership.WithPlatforms(cloud, completedConfig.ComponentConfig.KubeCloudShared.CloudProvider.Platforms),
 		completedConfig.ComponentConfig.NodeStatusUpdateFrequency.Duration,
 		completedConfig.ComponentConfig.NodeController.ConcurrentNodeSyncs,
 		completedConfig.ComponentConfig.NodeController.ConcurrentNodeStatusUpdates,
@@ -61,14 +62,20 @@ func startCloudNodeController(ctx context.Context, initContext ControllerInitCon
 }
 
 func startCloudNodeLifecycleController(ctx context.Context, initContext ControllerInitContext, controlexContext controllermanagerapp.ControllerContext, completedConfig *config.CompletedConfig, cloud cloudprovider.Interface) (controller.Interface, bool, error) {
+	var opts []cloudnodelifecyclecontroller.Option
+	if timeout := completedConfig.ComponentConfig.NodeLifecycleController.NodeLifecycleWaitTimeout; timeout != nil {
+		opts = append(opts, cloudnodelifecyclecontroller.WithNodeLifecycleWaitTimeout(timeout.Duration))
+	}
+
 	// Start the cloudNodeLifecycleController
 	cloudNodeLifecycleController, err := cloudnodelifecyclecontroller.NewCloudNodeLifecycleController(
 		completedConfig.SharedInformers.Core().V1().Nodes(),
 		// cloud node lifecycle controller uses existing cluster role from node-controller
 		completedConfig.ClientBuilder.ClientOrDie(initContext.ClientName),
-		cloud,
+		ownership.WithPlatforms(cloud, completedConfig.ComponentConfig.KubeCloudShared.CloudProvider.Platforms),
 		completedConfig.ComponentConfig.NodeLifecycleController.NodeMonitorPeriod.Duration,
 		int(completedConfig.ComponentConfig.NodeLifecycleController.ConcurrentNodeLifecycleSyncs),
+		opts...,
 	)
 	if err != nil {
 		klog.Warningf("failed to start cloud node lifecycle controller: %s", err)

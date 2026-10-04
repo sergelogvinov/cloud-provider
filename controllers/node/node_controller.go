@@ -43,6 +43,7 @@ import (
 	cloudprovider "k8s.io/cloud-provider"
 	cloudproviderapi "k8s.io/cloud-provider/api"
 	cloudnodeutil "k8s.io/cloud-provider/node/helpers"
+	"k8s.io/cloud-provider/node/ownership"
 	controllersmetrics "k8s.io/component-base/metrics/prometheus/controllers"
 	nodeutil "k8s.io/component-helpers/node/util"
 	"k8s.io/controller-manager/pkg/features"
@@ -107,6 +108,8 @@ type CloudNodeController struct {
 	recorder    record.EventRecorder
 
 	cloud cloudprovider.Interface
+	// ownership determines which nodes are managed by this cloud provider.
+	ownership *ownership.Checker
 
 	nodeStatusUpdateFrequency time.Duration
 	workerCount               int32
@@ -136,6 +139,7 @@ func NewCloudNodeController(
 		nodeInformer:              nodeInformer,
 		kubeClient:                kubeClient,
 		cloud:                     cloud,
+		ownership:                 ownership.NewChecker(ownership.Platforms(cloud)),
 		nodeStatusUpdateFrequency: nodeStatusUpdateFrequency,
 		workerCount:               workerCount,
 		statusUpdateWorkerCount:   statusUpdateWorkerCount,
@@ -153,6 +157,10 @@ func NewCloudNodeController(
 		AddFunc:    cnc.enqueueNode,
 		UpdateFunc: func(oldObj, newObj interface{}) { cnc.enqueueNode(newObj) },
 	})
+
+	if cnc.ownership.HybridMode() {
+		klog.Infof("Node ownership is enabled, managing nodes with platforms: %v", cnc.ownership.Platforms())
+	}
 
 	return cnc, nil
 }
@@ -287,8 +295,16 @@ func (cnc *CloudNodeController) UpdateNodeStatus(ctx context.Context) error {
 			return
 		}
 
+		if cnc.ownership.SkipNode(ownership.ControllerNode, node) {
+			return
+		}
+
 		instanceMetadata, err := cnc.getInstanceNodeAddresses(ctx, node)
 		if err != nil {
+			if ownership.IsNotOwned(err) {
+				ownership.RecordNotOwned(ownership.ControllerNode, node)
+				return
+			}
 			klog.Errorf("Error getting instance metadata for node addresses: %v", err)
 			return
 		}
@@ -488,6 +504,11 @@ func (cnc *CloudNodeController) syncNode(ctx context.Context, nodeName string) e
 		return err
 	}
 
+	// Nodes of other platforms are managed by other cloud controller managers.
+	if cnc.ownership.SkipNode(ownership.ControllerNode, curNode) {
+		return nil
+	}
+
 	cloudTaint := getCloudTaint(curNode.Spec.Taints)
 	if cloudTaint == nil {
 		// Node object was already initialized, only need to reconcile the labels
@@ -500,11 +521,27 @@ func (cnc *CloudNodeController) syncNode(ctx context.Context, nodeName string) e
 
 	instanceMetadata, err := cnc.getInstanceMetadata(ctx, copyNode)
 	if err != nil {
+		if ownership.IsNotOwned(err) {
+			ownership.RecordNotOwned(ownership.ControllerNode, copyNode)
+			return nil
+		}
+		if cnc.ownership.HybridMode() && copyNode.Spec.ProviderID == "" && errors.Is(err, cloudprovider.InstanceNotFound) {
+			// The node may belong to another cloud, and its ProviderID is not set yet.
+			// Do not change the node, it will be retried.
+			ownership.RecordSkipped(ownership.ControllerNode, ownership.ReasonNoProviderID)
+			return fmt.Errorf("node %s without ProviderID was not found in the cloud provider: %w", nodeName, err)
+		}
 		return fmt.Errorf("failed to get instance metadata for node %s: %v", nodeName, err)
 	}
 	if instanceMetadata == nil {
 		// do nothing when external cloud providers provide nil instanceMetadata
 		klog.Infof("Skip sync node %s because cloud provided nil metadata", nodeName)
+		return nil
+	}
+	if copyNode.Spec.ProviderID == "" && !cnc.ownership.OwnsProviderID(instanceMetadata.ProviderID) {
+		// The cloud provider returned a ProviderID of a platform it does not manage.
+		klog.V(2).Infof("Skip sync node %s because cloud provided ProviderID %q of unmanaged platform", nodeName, instanceMetadata.ProviderID)
+		ownership.RecordSkipped(ownership.ControllerNode, ownership.ReasonSchemeMismatch)
 		return nil
 	}
 
@@ -574,6 +611,22 @@ func (cnc *CloudNodeController) getNodeModifiersFromCloudProvider(
 	_, err := updateNodeAddressesFromNodeIP(node, instanceMeta.NodeAddresses)
 	if err != nil {
 		return nil, fmt.Errorf("provided node ip for node %q is not valid: %w", node.Name, err)
+	}
+
+	if cnc.ownership.HybridMode() {
+		providerID := node.Spec.ProviderID
+		if providerID == "" {
+			providerID = instanceMeta.ProviderID
+		}
+		if platform, ok := ownership.PlatformFromProviderID(providerID); ok {
+			klog.V(2).Infof("Adding node label from cloud provider: %s=%s", cloudproviderapi.LabelTopologyPlatform, platform)
+			nodeModifiers = append(nodeModifiers, func(n *v1.Node) {
+				if n.Labels == nil {
+					n.Labels = map[string]string{}
+				}
+				n.Labels[cloudproviderapi.LabelTopologyPlatform] = platform
+			})
+		}
 	}
 
 	if instanceMeta.InstanceType != "" {

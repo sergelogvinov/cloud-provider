@@ -19,6 +19,7 @@ package node
 import (
 	"sync"
 
+	"k8s.io/cloud-provider/node/ownership"
 	"k8s.io/component-base/metrics"
 	"k8s.io/component-base/metrics/legacyregistry"
 )
@@ -52,6 +53,7 @@ var metricRegistration sync.Once
 
 // registerMetrics registers the metrics that are to be monitored.
 func registerMetrics() {
+	ownership.RegisterMetrics()
 	metricRegistration.Do(func() {
 		legacyregistry.MustRegister(removeCloudProviderTaintDelay)
 		legacyregistry.MustRegister(initialNodeSyncDelay)

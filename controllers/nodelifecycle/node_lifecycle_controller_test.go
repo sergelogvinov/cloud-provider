@@ -29,6 +29,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes/fake"
@@ -36,6 +37,9 @@ import (
 	"k8s.io/client-go/tools/record"
 	cloudprovider "k8s.io/cloud-provider"
 	fakecloud "k8s.io/cloud-provider/fake"
+	"k8s.io/cloud-provider/features"
+	"k8s.io/cloud-provider/node/ownership"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	k8stest "k8s.io/component-base/metrics/testutil"
 	"k8s.io/klog/v2"
 	"k8s.io/klog/v2/ktesting"
@@ -1236,5 +1240,275 @@ func TestMonitorNodesMetrics(t *testing.T) {
 	}
 	if shutdownCount != 1.0 {
 		t.Errorf("expected %s calls count to be 1.0, but got %f", instanceShutdownOp, shutdownCount)
+	}
+}
+
+func newOwnershipTestNode(providerID string, created time.Time, ready v1.ConditionStatus, taints ...v1.Taint) *v1.Node {
+	return &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "node0",
+			CreationTimestamp: metav1.NewTime(created),
+		},
+		Spec: v1.NodeSpec{
+			ProviderID: providerID,
+			Taints:     taints,
+		},
+		Status: v1.NodeStatus{
+			Conditions: []v1.NodeCondition{
+				{
+					Type:               v1.NodeReady,
+					Status:             ready,
+					LastHeartbeatTime:  metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+					LastTransitionTime: metav1.Date(2015, 1, 1, 12, 0, 0, 0, time.UTC),
+				},
+			},
+		},
+	}
+}
+
+func Test_MonitorNodesOwnership(t *testing.T) {
+	old := time.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC)
+	now := time.Now()
+	waitTimeout := 30 * time.Second
+	noWait := time.Duration(0)
+
+	tests := []struct {
+		name            string
+		platforms       []string
+		waitTimeout     *time.Duration
+		fakeCloud       *fakecloud.Cloud
+		existingNode    *v1.Node
+		expectedDeleted bool
+		expectedTaints  []v1.Taint
+		expectedCalls   []string
+	}{
+		{
+			name:            "node of another platform is not deleted",
+			platforms:       []string{"test"},
+			fakeCloud:       &fakecloud.Cloud{EnableInstancesV2: true, ExistsByProviderID: false},
+			existingNode:    newOwnershipTestNode("baremetal://node0", old, v1.ConditionFalse),
+			expectedDeleted: false,
+			expectedCalls:   []string{},
+		},
+		{
+			name:            "node of another platform is deleted without platforms",
+			platforms:       nil,
+			fakeCloud:       &fakecloud.Cloud{EnableInstancesV2: true, ExistsByProviderID: false},
+			existingNode:    newOwnershipTestNode("baremetal://node0", old, v1.ConditionFalse),
+			expectedDeleted: true,
+			expectedCalls:   []string{"instance-exists"},
+		},
+		{
+			name:            "shutdown taint of a ready node of another platform is kept",
+			platforms:       []string{"test"},
+			fakeCloud:       &fakecloud.Cloud{EnableInstancesV2: true},
+			existingNode:    newOwnershipTestNode("baremetal://node0", old, v1.ConditionTrue, *ShutdownTaint),
+			expectedDeleted: false,
+			expectedTaints:  []v1.Taint{*ShutdownTaint},
+			expectedCalls:   []string{},
+		},
+		{
+			name:            "node of this platform that does not exist is deleted",
+			platforms:       []string{"test"},
+			fakeCloud:       &fakecloud.Cloud{EnableInstancesV2: true, ExistsByProviderID: false},
+			existingNode:    newOwnershipTestNode("test://node0", old, v1.ConditionFalse),
+			expectedDeleted: true,
+			expectedCalls:   []string{"instance-exists"},
+		},
+		{
+			name:      "node owned by another installation is not deleted",
+			platforms: []string{"test"},
+			fakeCloud: &fakecloud.Cloud{
+				EnableInstancesV2:  true,
+				ExistsByProviderID: false,
+				ErrByProviderID:    cloudprovider.NotOwned,
+			},
+			existingNode:    newOwnershipTestNode("test://region-2/node0", old, v1.ConditionFalse),
+			expectedDeleted: false,
+			expectedCalls:   []string{"instance-exists"},
+		},
+		{
+			name:      "node owned by another installation is not tainted",
+			platforms: []string{"test"},
+			fakeCloud: &fakecloud.Cloud{
+				EnableInstancesV2:       true,
+				ExistsByProviderID:      true,
+				NodeShutdown:            true,
+				ErrShutdownByProviderID: cloudprovider.NotOwned,
+			},
+			existingNode:    newOwnershipTestNode("test://region-2/node0", old, v1.ConditionFalse),
+			expectedDeleted: false,
+			expectedCalls:   []string{"instance-exists", "instance-shutdown"},
+		},
+		{
+			name:            "node of another platform is processed with all platforms",
+			platforms:       []string{"*"},
+			fakeCloud:       &fakecloud.Cloud{EnableInstancesV2: true, ExistsByProviderID: false},
+			existingNode:    newOwnershipTestNode("baremetal://node0", old, v1.ConditionFalse),
+			expectedDeleted: true,
+			expectedCalls:   []string{"instance-exists"},
+		},
+		{
+			name:      "node not owned with all platforms is not deleted",
+			platforms: []string{"*"},
+			fakeCloud: &fakecloud.Cloud{
+				EnableInstancesV2:  true,
+				ExistsByProviderID: false,
+				ErrByProviderID:    cloudprovider.NotOwned,
+			},
+			existingNode:    newOwnershipTestNode("baremetal://node0", old, v1.ConditionFalse),
+			expectedDeleted: false,
+			expectedCalls:   []string{"instance-exists"},
+		},
+		{
+			name:            "new node without ProviderID waits for initialization with all platforms",
+			platforms:       []string{"*"},
+			fakeCloud:       &fakecloud.Cloud{EnableInstancesV2: true, ExistsByProviderID: false},
+			existingNode:    newOwnershipTestNode("", now, v1.ConditionFalse),
+			expectedDeleted: false,
+			expectedCalls:   []string{},
+		},
+		{
+			name:            "new node without ProviderID waits for initialization",
+			platforms:       []string{"test"},
+			fakeCloud:       &fakecloud.Cloud{EnableInstancesV2: true, ExistsByProviderID: false},
+			existingNode:    newOwnershipTestNode("", now, v1.ConditionFalse),
+			expectedDeleted: false,
+			expectedCalls:   []string{},
+		},
+		{
+			name:            "new node without ProviderID waits for the custom timeout",
+			platforms:       []string{"test"},
+			waitTimeout:     &waitTimeout,
+			fakeCloud:       &fakecloud.Cloud{EnableInstancesV2: true, ExistsByProviderID: false},
+			existingNode:    newOwnershipTestNode("", now.Add(-waitTimeout/2), v1.ConditionFalse),
+			expectedDeleted: false,
+			expectedCalls:   []string{},
+		},
+		{
+			name:            "new node without ProviderID is processed with zero timeout",
+			platforms:       []string{"test"},
+			waitTimeout:     &noWait,
+			fakeCloud:       &fakecloud.Cloud{EnableInstancesV2: true, ExistsByProviderID: false},
+			existingNode:    newOwnershipTestNode("", now, v1.ConditionFalse),
+			expectedDeleted: true,
+			expectedCalls:   []string{"instance-exists"},
+		},
+		{
+			name:            "new node without ProviderID is processed without platforms by default",
+			platforms:       nil,
+			fakeCloud:       &fakecloud.Cloud{EnableInstancesV2: true, ExistsByProviderID: false},
+			existingNode:    newOwnershipTestNode("", now, v1.ConditionFalse),
+			expectedDeleted: true,
+			expectedCalls:   []string{"instance-exists"},
+		},
+		{
+			name:            "new node without ProviderID waits for the custom timeout without platforms",
+			platforms:       nil,
+			waitTimeout:     &waitTimeout,
+			fakeCloud:       &fakecloud.Cloud{EnableInstancesV2: true, ExistsByProviderID: false},
+			existingNode:    newOwnershipTestNode("", now, v1.ConditionFalse),
+			expectedDeleted: false,
+			expectedCalls:   []string{},
+		},
+		{
+			name:            "old node without ProviderID is processed with the custom timeout without platforms",
+			platforms:       nil,
+			waitTimeout:     &waitTimeout,
+			fakeCloud:       &fakecloud.Cloud{EnableInstancesV2: true, ExistsByProviderID: false},
+			existingNode:    newOwnershipTestNode("", old, v1.ConditionFalse),
+			expectedDeleted: true,
+			expectedCalls:   []string{"instance-exists"},
+		},
+		{
+			name:            "old node without ProviderID uses the default behavior",
+			platforms:       []string{"test"},
+			fakeCloud:       &fakecloud.Cloud{EnableInstancesV2: true, ExistsByProviderID: false},
+			existingNode:    newOwnershipTestNode("", old, v1.ConditionFalse),
+			expectedDeleted: true,
+			expectedCalls:   []string{"instance-exists"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+
+			clientset := fake.NewSimpleClientset(test.existingNode)
+			informer := informers.NewSharedInformerFactory(clientset, time.Second)
+			nodeInformer := informer.Core().V1().Nodes()
+
+			if err := syncNodeStore(ctx, nodeInformer, clientset); err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+
+			eventBroadcaster := record.NewBroadcaster(record.WithContext(ctx))
+			cloudNodeLifecycleController := &CloudNodeLifecycleController{
+				nodeLister:                   nodeInformer.Lister(),
+				kubeClient:                   clientset,
+				cloud:                        test.fakeCloud,
+				ownership:                    ownership.NewChecker(test.platforms),
+				nodeLifecycleWaitTimeout:     test.waitTimeout,
+				recorder:                     eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "cloud-node-lifecycle-controller"}),
+				nodeMonitorPeriod:            1 * time.Second,
+				concurrentNodeLifecycleSyncs: 1,
+			}
+
+			test.fakeCloud.ClearCalls()
+			cloudNodeLifecycleController.MonitorNodes(ctx)
+
+			updatedNode, err := clientset.CoreV1().Nodes().Get(ctx, test.existingNode.Name, metav1.GetOptions{})
+			if test.expectedDeleted != apierrors.IsNotFound(err) {
+				t.Fatalf("expected deleted: %v, got error: %v", test.expectedDeleted, err)
+			}
+			if !test.expectedDeleted && !cmp.Equal(updatedNode.Spec.Taints, test.expectedTaints) {
+				t.Errorf("unexpected taints %s", cmp.Diff(test.expectedTaints, updatedNode.Spec.Taints))
+			}
+			if !cmp.Equal(test.fakeCloud.Calls, test.expectedCalls) {
+				t.Errorf("unexpected cloud calls %s", cmp.Diff(test.expectedCalls, test.fakeCloud.Calls))
+			}
+		})
+	}
+}
+
+func TestNewCloudNodeLifecycleControllerOwnership(t *testing.T) {
+	clientset := fake.NewSimpleClientset()
+	informer := informers.NewSharedInformerFactory(clientset, time.Second)
+	cloud := &fakecloud.Cloud{EnableInstancesV2: true, Platforms: []string{"test"}}
+
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CloudProviderNodeOwnership, false)
+	c, err := NewCloudNodeLifecycleController(informer.Core().V1().Nodes(), clientset, cloud, time.Second, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ownership.HybridMode() || c.waitTimeout() != 0 {
+		t.Errorf("unexpected hybrid mode %v or wait timeout %v with disabled feature gate", c.ownership.HybridMode(), c.waitTimeout())
+	}
+
+	c, err = NewCloudNodeLifecycleController(informer.Core().V1().Nodes(), clientset, cloud, time.Second, 1, WithNodeLifecycleWaitTimeout(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ownership.HybridMode() || c.waitTimeout() != time.Minute {
+		t.Errorf("unexpected hybrid mode %v or wait timeout %v with disabled feature gate", c.ownership.HybridMode(), c.waitTimeout())
+	}
+
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.CloudProviderNodeOwnership, true)
+	c, err = NewCloudNodeLifecycleController(informer.Core().V1().Nodes(), clientset, cloud, time.Second, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.ownership.HybridMode() || c.waitTimeout() != ownership.DefaultNodeLifecycleWaitTimeout {
+		t.Errorf("unexpected hybrid mode %v or wait timeout %v", c.ownership.HybridMode(), c.waitTimeout())
+	}
+
+	c, err = NewCloudNodeLifecycleController(informer.Core().V1().Nodes(), clientset, cloud, time.Second, 1, WithNodeLifecycleWaitTimeout(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.waitTimeout() != time.Minute {
+		t.Errorf("unexpected wait timeout %v", c.waitTimeout())
 	}
 }

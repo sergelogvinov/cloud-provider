@@ -41,6 +41,8 @@ import (
 	cloudprovider "k8s.io/cloud-provider"
 	cloudproviderapi "k8s.io/cloud-provider/api"
 	fakecloud "k8s.io/cloud-provider/fake"
+	cpfeatures "k8s.io/cloud-provider/features"
+	"k8s.io/cloud-provider/node/ownership"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/controller-manager/pkg/features"
 	_ "k8s.io/controller-manager/pkg/features/register"
@@ -3085,5 +3087,278 @@ func TestUpdateNodeStatus(t *testing.T) {
 			}
 
 		})
+	}
+}
+
+func newOwnershipTestNode(providerID string, tainted bool) *v1.Node {
+	node := &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "node0",
+			CreationTimestamp: metav1.Date(2012, 1, 1, 0, 0, 0, 0, time.UTC),
+			Labels:            map[string]string{},
+		},
+		Spec: v1.NodeSpec{
+			ProviderID: providerID,
+		},
+	}
+	if tainted {
+		node.Spec.Taints = []v1.Taint{
+			{
+				Key:    cloudproviderapi.TaintExternalCloudProvider,
+				Value:  "true",
+				Effect: v1.TaintEffectNoSchedule,
+			},
+		}
+	}
+	return node
+}
+
+func Test_syncNodeOwnership(t *testing.T) {
+	tests := []struct {
+		name          string
+		platforms     []string
+		fakeCloud     *fakecloud.Cloud
+		existingNode  *v1.Node
+		expectedNode  *v1.Node
+		expectedErr   bool
+		expectedCalls []string
+	}{
+		{
+			name:      "node of another platform is skipped",
+			platforms: []string{"test"},
+			fakeCloud: &fakecloud.Cloud{
+				EnableInstancesV2: true,
+				ProviderID:        map[types.NodeName]string{"node0": "test://node0"},
+			},
+			existingNode:  newOwnershipTestNode("baremetal://node0", true),
+			expectedNode:  newOwnershipTestNode("baremetal://node0", true),
+			expectedCalls: []string{},
+		},
+		{
+			name:      "initialized node of another platform is not reconciled",
+			platforms: []string{"test"},
+			fakeCloud: &fakecloud.Cloud{EnableInstancesV2: true},
+			existingNode: func() *v1.Node {
+				node := newOwnershipTestNode("baremetal://node0", false)
+				node.Labels[v1.LabelFailureDomainBetaZone] = "zone-a"
+				return node
+			}(),
+			expectedNode: func() *v1.Node {
+				node := newOwnershipTestNode("baremetal://node0", false)
+				node.Labels[v1.LabelFailureDomainBetaZone] = "zone-a"
+				return node
+			}(),
+			expectedCalls: []string{},
+		},
+		{
+			name:         "node of this platform is initialized with platform label",
+			platforms:    []string{"test"},
+			fakeCloud:    &fakecloud.Cloud{EnableInstancesV2: true},
+			existingNode: newOwnershipTestNode("test://node0", true),
+			expectedNode: func() *v1.Node {
+				node := newOwnershipTestNode("test://node0", false)
+				node.Spec.Taints = []v1.Taint{}
+				node.Labels[cloudproviderapi.LabelTopologyPlatform] = "test"
+				return node
+			}(),
+			expectedCalls: []string{"instance-metadata-by-provider-id"},
+		},
+		{
+			name:      "node of this platform owned by another installation is skipped",
+			platforms: []string{"test"},
+			fakeCloud: &fakecloud.Cloud{
+				EnableInstancesV2: true,
+				MetadataErr:       cloudprovider.NotOwned,
+			},
+			existingNode:  newOwnershipTestNode("test://region-2/node0", true),
+			expectedNode:  newOwnershipTestNode("test://region-2/node0", true),
+			expectedCalls: []string{"instance-metadata-by-provider-id"},
+		},
+		{
+			name:      "node without ProviderID found in the cloud is initialized",
+			platforms: []string{"test"},
+			fakeCloud: &fakecloud.Cloud{
+				EnableInstancesV2: true,
+				ProviderID:        map[types.NodeName]string{"node0": "test://node0"},
+			},
+			existingNode: newOwnershipTestNode("", true),
+			expectedNode: func() *v1.Node {
+				node := newOwnershipTestNode("test://node0", false)
+				node.Spec.Taints = []v1.Taint{}
+				node.Labels[cloudproviderapi.LabelTopologyPlatform] = "test"
+				return node
+			}(),
+			expectedCalls: []string{"instance-metadata-by-provider-id"},
+		},
+		{
+			name:      "node without ProviderID resolved to another platform is skipped",
+			platforms: []string{"test"},
+			fakeCloud: &fakecloud.Cloud{
+				EnableInstancesV2: true,
+				ProviderID:        map[types.NodeName]string{"node0": "other://node0"},
+			},
+			existingNode:  newOwnershipTestNode("", true),
+			expectedNode:  newOwnershipTestNode("", true),
+			expectedCalls: []string{"instance-metadata-by-provider-id"},
+		},
+		{
+			name:      "node without ProviderID not found in the cloud is not changed",
+			platforms: []string{"test"},
+			fakeCloud: &fakecloud.Cloud{
+				EnableInstancesV2: true,
+				MetadataErr:       cloudprovider.InstanceNotFound,
+			},
+			existingNode:  newOwnershipTestNode("", true),
+			expectedNode:  newOwnershipTestNode("", true),
+			expectedErr:   true,
+			expectedCalls: []string{"instance-metadata-by-provider-id"},
+		},
+		{
+			name:         "without platforms all nodes are managed and platform label is not set",
+			platforms:    nil,
+			fakeCloud:    &fakecloud.Cloud{EnableInstancesV2: true},
+			existingNode: newOwnershipTestNode("baremetal://node0", true),
+			expectedNode: func() *v1.Node {
+				node := newOwnershipTestNode("baremetal://node0", false)
+				node.Spec.Taints = []v1.Taint{}
+				return node
+			}(),
+			expectedCalls: []string{"instance-metadata-by-provider-id"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+
+			clientset := fake.NewSimpleClientset(test.existingNode)
+			factory := informers.NewSharedInformerFactory(clientset, 0)
+
+			eventBroadcaster := record.NewBroadcaster(record.WithContext(ctx))
+			cloudNodeController := &CloudNodeController{
+				kubeClient:                clientset,
+				nodeInformer:              factory.Core().V1().Nodes(),
+				nodesLister:               factory.Core().V1().Nodes().Lister(),
+				cloud:                     test.fakeCloud,
+				ownership:                 ownership.NewChecker(test.platforms),
+				recorder:                  eventBroadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "cloud-node-controller"}),
+				nodeStatusUpdateFrequency: 1 * time.Second,
+			}
+
+			stopCh := make(chan struct{})
+			defer close(stopCh)
+
+			factory.Start(stopCh)
+			factory.WaitForCacheSync(stopCh)
+
+			test.fakeCloud.ClearCalls()
+
+			err := cloudNodeController.syncNode(ctx, test.existingNode.Name)
+			if (err != nil) != test.expectedErr {
+				t.Fatalf("error got: %v expected: %v", err, test.expectedErr)
+			}
+
+			updatedNode, err := clientset.CoreV1().Nodes().Get(ctx, test.existingNode.Name, metav1.GetOptions{})
+			if err != nil {
+				t.Fatalf("error getting updated nodes: %v", err)
+			}
+
+			if !cmp.Equal(updatedNode, test.expectedNode) {
+				t.Errorf("unexpected node %s", cmp.Diff(test.expectedNode, updatedNode))
+			}
+
+			if !cmp.Equal(test.fakeCloud.Calls, test.expectedCalls) {
+				t.Errorf("unexpected cloud calls %s", cmp.Diff(test.expectedCalls, test.fakeCloud.Calls))
+			}
+		})
+	}
+}
+
+func TestUpdateNodeStatusOwnership(t *testing.T) {
+	tests := []struct {
+		name          string
+		fakeCloud     *fakecloud.Cloud
+		existingNode  *v1.Node
+		expectedCalls []string
+	}{
+		{
+			name:          "node of another platform is skipped",
+			fakeCloud:     &fakecloud.Cloud{EnableInstancesV2: true},
+			existingNode:  newOwnershipTestNode("baremetal://node0", false),
+			expectedCalls: []string{},
+		},
+		{
+			name: "node owned by another installation is not patched",
+			fakeCloud: &fakecloud.Cloud{
+				EnableInstancesV2: true,
+				MetadataErr:       cloudprovider.NotOwned,
+				Addresses:         []v1.NodeAddress{{Type: v1.NodeInternalIP, Address: "10.0.0.1"}},
+			},
+			existingNode:  newOwnershipTestNode("test://region-2/node0", false),
+			expectedCalls: []string{"instance-metadata-by-provider-id"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, ctx := ktesting.NewTestContext(t)
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+
+			clientset := fake.NewSimpleClientset(test.existingNode)
+			factory := informers.NewSharedInformerFactory(clientset, 0)
+			nodeInformer := factory.Core().V1().Nodes()
+			if err := nodeInformer.Informer().GetIndexer().Add(test.existingNode); err != nil {
+				t.Fatal(err)
+			}
+
+			cloudNodeController := &CloudNodeController{
+				kubeClient:              clientset,
+				nodeInformer:            nodeInformer,
+				nodesLister:             nodeInformer.Lister(),
+				cloud:                   test.fakeCloud,
+				ownership:               ownership.NewChecker([]string{"test"}),
+				statusUpdateWorkerCount: 1,
+			}
+
+			clientset.ClearActions()
+			test.fakeCloud.ClearCalls()
+			if err := cloudNodeController.UpdateNodeStatus(ctx); err != nil {
+				t.Fatalf("error updating node status: %v", err)
+			}
+
+			if actions := clientset.Actions(); len(actions) != 0 {
+				t.Errorf("unexpected actions: %v", actions)
+			}
+			if !cmp.Equal(test.fakeCloud.Calls, test.expectedCalls) {
+				t.Errorf("unexpected cloud calls %s", cmp.Diff(test.expectedCalls, test.fakeCloud.Calls))
+			}
+		})
+	}
+}
+
+func TestNewCloudNodeControllerOwnership(t *testing.T) {
+	clientset := fake.NewSimpleClientset()
+	factory := informers.NewSharedInformerFactory(clientset, 0)
+	cloud := &fakecloud.Cloud{EnableInstancesV2: true, Platforms: []string{"test"}}
+
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, cpfeatures.CloudProviderNodeOwnership, false)
+	cnc, err := NewCloudNodeController(factory.Core().V1().Nodes(), clientset, cloud, time.Second, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cnc.ownership.HybridMode() {
+		t.Errorf("hybrid mode must be disabled when the feature gate is disabled")
+	}
+
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, cpfeatures.CloudProviderNodeOwnership, true)
+	cnc, err = NewCloudNodeController(factory.Core().V1().Nodes(), clientset, ownership.WithPlatforms(cloud, []string{"test", "other"}), time.Second, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cmp.Equal(cnc.ownership.Platforms(), []string{"other", "test"}) {
+		t.Errorf("unexpected platforms: %v", cnc.ownership.Platforms())
 	}
 }

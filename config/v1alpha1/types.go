@@ -89,6 +89,11 @@ type CloudProviderConfiguration struct {
 	Name string
 	// cloudConfigFile is the path to the cloud provider configuration file.
 	CloudConfigFile string
+	// Platforms is the list of platform identifiers (ProviderID schemes) managed by
+	// this cloud controller manager. It overrides the list returned by the cloud provider.
+	// The "*" identifier matches nodes of any platform.
+	// Used only when the CloudProviderNodeOwnership feature gate is enabled.
+	Platforms []string
 }
 
 // WebhookConfiguration contains configuration related to

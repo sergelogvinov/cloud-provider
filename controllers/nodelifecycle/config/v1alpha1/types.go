@@ -24,4 +24,7 @@ type NodeLifecycleControllerConfiguration struct {
 	NodeMonitorPeriod metav1.Duration
 	// ConcurrentNodeLifecycleSyncs is the number of workers for syncing NodeStatus in CloudNodeLifecycleController.
 	ConcurrentNodeLifecycleSyncs int32
+	// NodeLifecycleWaitTimeout is the time CloudNodeLifecycleController waits for a node
+	// without ProviderID to be initialized by its own cloud controller manager.
+	NodeLifecycleWaitTimeout *metav1.Duration
 }

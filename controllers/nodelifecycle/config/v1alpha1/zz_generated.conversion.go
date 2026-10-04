@@ -22,6 +22,9 @@ limitations under the License.
 package v1alpha1
 
 import (
+	unsafe "unsafe"
+
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	conversion "k8s.io/apimachinery/pkg/conversion"
 	runtime "k8s.io/apimachinery/pkg/runtime"
 	config "k8s.io/cloud-provider/controllers/nodelifecycle/config"
@@ -50,11 +53,13 @@ func RegisterConversions(s *runtime.Scheme) error {
 func autoConvert_v1alpha1_NodeLifecycleControllerConfiguration_To_config_NodeLifecycleControllerConfiguration(in *NodeLifecycleControllerConfiguration, out *config.NodeLifecycleControllerConfiguration, s conversion.Scope) error {
 	out.NodeMonitorPeriod = in.NodeMonitorPeriod
 	out.ConcurrentNodeLifecycleSyncs = in.ConcurrentNodeLifecycleSyncs
+	out.NodeLifecycleWaitTimeout = (*v1.Duration)(unsafe.Pointer(in.NodeLifecycleWaitTimeout))
 	return nil
 }
 
 func autoConvert_config_NodeLifecycleControllerConfiguration_To_v1alpha1_NodeLifecycleControllerConfiguration(in *config.NodeLifecycleControllerConfiguration, out *NodeLifecycleControllerConfiguration, s conversion.Scope) error {
 	out.NodeMonitorPeriod = in.NodeMonitorPeriod
 	out.ConcurrentNodeLifecycleSyncs = in.ConcurrentNodeLifecycleSyncs
+	out.NodeLifecycleWaitTimeout = (*v1.Duration)(unsafe.Pointer(in.NodeLifecycleWaitTimeout))
 	return nil
 }

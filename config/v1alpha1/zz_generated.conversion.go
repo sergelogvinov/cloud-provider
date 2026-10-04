@@ -143,12 +143,14 @@ func Convert_config_CloudControllerManagerConfiguration_To_v1alpha1_CloudControl
 func autoConvert_v1alpha1_CloudProviderConfiguration_To_config_CloudProviderConfiguration(in *CloudProviderConfiguration, out *config.CloudProviderConfiguration, s conversion.Scope) error {
 	out.Name = in.Name
 	out.CloudConfigFile = in.CloudConfigFile
+	out.Platforms = *(*[]string)(unsafe.Pointer(&in.Platforms))
 	return nil
 }
 
 func autoConvert_config_CloudProviderConfiguration_To_v1alpha1_CloudProviderConfiguration(in *config.CloudProviderConfiguration, out *CloudProviderConfiguration, s conversion.Scope) error {
 	out.Name = in.Name
 	out.CloudConfigFile = in.CloudConfigFile
+	out.Platforms = *(*[]string)(unsafe.Pointer(&in.Platforms))
 	return nil
 }
 

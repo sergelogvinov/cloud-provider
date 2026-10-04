@@ -64,6 +64,16 @@ type Interface interface {
 	Routes() (Routes, bool)
 	// ProviderName returns the cloud provider ID.
 	ProviderName() string
+	// ProviderPlatforms returns a list of platform identifiers
+	// that the cloud provider supports.
+	// A platform identifier is the ProviderID scheme, the part before "://"
+	// in the ProviderID field of NodeSpec.
+	// Examples: "aws", "gce", "azure", "hcloud", "hrobot", "*".
+	// An empty list means the provider assumes a single-cloud cluster.
+	// The "*" identifier means the provider manages nodes of any platform
+	// while coexisting with other cloud controller managers.
+	// It is used only when the CloudProviderNodeOwnership feature gate is enabled.
+	ProviderPlatforms() []string
 	// HasClusterID returns true if a ClusterID is required and set
 	HasClusterID() bool
 }
@@ -260,6 +270,7 @@ var (
 	ImplementedElsewhere = errors.New("implemented by alternate to cloud provider")
 	InstanceNotFound     = errors.New("instance not found")
 	NotImplemented       = errors.New("unimplemented")
+	NotOwned             = errors.New("node is not owned by this cloud provider")
 )
 
 // Zone represents the location of a particular machine.

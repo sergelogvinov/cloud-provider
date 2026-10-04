@@ -19,6 +19,7 @@ package nodelifecycle
 import (
 	"sync"
 
+	"k8s.io/cloud-provider/node/ownership"
 	"k8s.io/component-base/metrics"
 	"k8s.io/component-base/metrics/legacyregistry"
 )
@@ -40,7 +41,8 @@ var (
 	)
 
 	// cloudProviderCalls is a counter vector that tracks the total number of cloud provider API calls.
-	// It is labeled by the operation (e.g., "instance_exists", "instance_shutdown", "instance_metadata") and the result ("success", "error", "instance_not_found", "not_implemented", "canceled").
+	// It is labeled by the operation (e.g., "instance_exists", "instance_shutdown", "instance_metadata") and the result ("success", "error", "instance_not_found",
+	// "not_owned", "not_implemented", "canceled").
 	cloudProviderCalls = metrics.NewCounterVec(
 		&metrics.CounterOpts{
 			Subsystem:      metricsSubsystem,
@@ -56,6 +58,7 @@ var metricRegistration sync.Once
 
 // registerMetrics registers the metrics that are to be monitored.
 func registerMetrics() {
+	ownership.RegisterMetrics()
 	metricRegistration.Do(func() {
 		legacyregistry.MustRegister(monitorNodesDuration)
 		legacyregistry.MustRegister(cloudProviderCalls)
